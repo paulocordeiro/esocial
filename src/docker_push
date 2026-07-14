@@ -1,3 +1,0 @@
-#!/bin/bash
-mvn install -DskipTests -B
-docker buildx build --platform linux/amd64 -t link3tecnologia/esocial-jt-service:14jul26 --push .

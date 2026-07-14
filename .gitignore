@@ -1,3 +1,6 @@
 .vscode/
 .idea/
 gh-md-toc
+
+# Script de deploy proprio, mantido apenas localmente
+src/docker_push
