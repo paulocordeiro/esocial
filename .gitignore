@@ -4,3 +4,9 @@ gh-md-toc
 
 # Script de deploy proprio, mantido apenas localmente
 src/docker_push
+
+# Ferramental e artefatos de IA, mantidos apenas localmente
+.claude/
+.specify/
+CLAUDE.md
+specs/
