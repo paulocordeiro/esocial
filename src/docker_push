@@ -1,5 +1,4 @@
 #!/bin/bash
 mvn install -DskipTests -B
-docker build -t tstlabs/esocial-jt-service .
-echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
-docker push tstlabs/esocial-jt-service
+#echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+docker buildx build --platform linux/amd64 -t link3tecnologia/esocial-jt-service:29jun26 --push .

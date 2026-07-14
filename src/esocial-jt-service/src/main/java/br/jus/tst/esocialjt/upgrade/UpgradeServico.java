@@ -2,32 +2,35 @@ package br.jus.tst.esocialjt.upgrade;
 
 import br.jus.tst.esocial.ocorrencia.dados.DadosFechamentoFolha;
 import br.jus.tst.esocial.ocorrencia.dados.DadosFolha;
-import br.jus.tst.esocial.ocorrencia.dados.Exclusao;
 import br.jus.tst.esocialjt.dominio.Estado;
 import br.jus.tst.esocialjt.dominio.Ocorrencia;
 import br.jus.tst.esocialjt.dominio.TipoEvento;
 import br.jus.tst.esocialjt.ocorrencia.OcorrenciaRepository;
-import br.jus.tst.esocialjt.ocorrencia.OcorrenciaSpecs;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
-import org.springframework.data.domain.Sort;
-import org.springframework.scheduling.annotation.Async;
+import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 
+/**
+ * Upgrades de dados executados na inicialização.
+ *
+ * Todos percorrem a base em lotes por keyset e delegam cada lote ao {@link UpgradeLoteServico},
+ * que abre uma transação e limpa o contexto de persistência ao final. É o que mantém o consumo
+ * de memória constante, independente do volume da base.
+ */
 @Service
 public class UpgradeServico {
     private static final Logger LOGGER = LoggerFactory.getLogger(UpgradeServico.class);
+
+    private static final int TAMANHO_LOTE = 100;
+    private static final long ID_INICIAL = 0L;
 
     @Autowired
     ControleUpgradeRepository upgradeRepository;
@@ -36,12 +39,28 @@ public class UpgradeServico {
     OcorrenciaRepository ocorrenciaRepository;
 
     @Autowired
-    OcorrenciaSpecs specs;
+    UpgradeLoteServico upgradeLoteServico;
 
+    /**
+     * Cada upgrade é isolado: um que falhe não impede os seguintes, nem o restante da
+     * inicialização. Sem isso, uma falha aqui deixa o serviço no ar sem nunca agendar o ciclo
+     * de envio.
+     */
     public void realizarUpgrades() {
-        upgradeCpfMatricula();
-        upgradeExclusaoRetificacao();
-        upgradePeriodoApuracao();
+        executarIsolado(Upgrade.CAMPO_CPF_MATRICULA, this::upgradeCpfMatricula);
+        executarIsolado(Upgrade.CAMPO_EXCLUSAO_RETIFICACAO, this::upgradeExclusaoRetificacao);
+        executarIsolado(Upgrade.CAMPO_PERIODO_APURACAO, this::upgradePeriodoApuracao);
+    }
+
+    /** Captura Throwable, e não Exception: OutOfMemoryError é Error e escaparia da captura. */
+    private void executarIsolado(Upgrade upgrade, Runnable execucao) {
+        try {
+            execucao.run();
+        } catch (Throwable falha) {
+            LOGGER.error("Upgrade '{}' (código {}) falhou e não foi registrado como concluído; "
+                            + "será tentado novamente na próxima inicialização",
+                    upgrade.desUpgrade, upgrade.codUpgrade, falha);
+        }
     }
 
     public void upgradeCpfMatricula() {
@@ -52,26 +71,28 @@ public class UpgradeServico {
         }
     }
 
-    @Async
     public void realizaUpgradeCpfMatricula() {
         LOGGER.info("Upgrade: " + Upgrade.CAMPO_CPF_MATRICULA.desUpgrade);
-        final int size = 100;
-        int page = 0;
-        Page<Ocorrencia> pagina;
+
+        long ultimoId = ID_INICIAL;
+        int totalAtualizacoes = 0;
+        int totalPercorrido = 0;
+        List<Long> ids;
 
         do {
-            pagina = ocorrenciaRepository.findAll(PageRequest.of(page, size, Sort.by("id")));
-            int elemento = page * size + pagina.getNumberOfElements();
-            LOGGER.info("Atualização de CPF e Matricula: Evento {} de {}", elemento, pagina.getTotalElements());
+            ids = ocorrenciaRepository.buscarIdsOcorrenciasAposId(ultimoId, lote());
 
-            pagina.getContent().forEach(o -> {
-                o.setMatricula(o.getDadosOcorrencia().getMatricula());
-                o.setCpf(o.getDadosOcorrencia().getCpf());
-            });
-            ocorrenciaRepository.saveAll(pagina.getContent());
+            if (!ids.isEmpty()) {
+                totalAtualizacoes += upgradeLoteServico.processarLoteCpfMatricula(ids);
+                totalPercorrido += ids.size();
+                ultimoId = ids.get(ids.size() - 1);
+                LOGGER.info("Atualização de CPF e Matrícula: {} ocorrências percorridas, {} atualizadas",
+                        totalPercorrido, totalAtualizacoes);
+            }
+        } while (ids.size() == TAMANHO_LOTE);
 
-            page++;
-        } while (pagina.hasNext());
+        LOGGER.info("Atualização de CPF e Matrícula concluída. Total de {} ocorrências atualizadas",
+                totalAtualizacoes);
     }
 
     public void upgradeExclusaoRetificacao() {
@@ -82,88 +103,64 @@ public class UpgradeServico {
         }
     }
 
-    @Async
+    /**
+     * Percorre as origens (exclusões e retificações) e atinge cada alvo por um UPDATE
+     * direcionado pelo recibo, que é indexado. Nenhuma ocorrência-alvo é carregada em memória.
+     */
     public void realizaUpgradeExclusaoRetificacao() {
         LOGGER.info("Upgrade: " + Upgrade.CAMPO_EXCLUSAO_RETIFICACAO.desUpgrade);
 
-        // Passo 1: Buscar todas as ocorrências de exclusão processadas com sucesso usando specs
-        LOGGER.info("Buscando ocorrências de exclusão...");
-        List<Ocorrencia> exclusoes = ocorrenciaRepository.findAll(
-                specs.nosEstados(Collections.singletonList(Estado.PROCESSADO_COM_SUCESSO))
-                        .and(specs.dosTipos(Collections.singletonList(TipoEvento.EXCLUSAO)))
-        );
+        int vinculosExclusao = processarExclusoes();
+        int vinculosRetificacao = processarRetificacoes();
 
-        LOGGER.info("Total de exclusões encontradas: {}", exclusoes.size());
+        LOGGER.info("Processamento de exclusões e retificações concluído. {} vínculos de exclusão e "
+                + "{} de retificação criados", vinculosExclusao, vinculosRetificacao);
+    }
 
-        // Criar mapa: nrRecEvt -> ID da ocorrência de exclusão
-        Map<String, Long> mapaExclusoes = criarMapaExclusoes(exclusoes);
+    private int processarExclusoes() {
+        LOGGER.info("Processando exclusões...");
 
-        LOGGER.info("Mapa de exclusões criado com {} entradas", mapaExclusoes.size());
-
-        // Passo 2: Buscar todas as ocorrências com retificação processadas com sucesso
-        LOGGER.info("Buscando ocorrências com retificação...");
-        List<Object[]> retificacoes = ocorrenciaRepository.buscarOcorrenciasComRetificacao(Estado.PROCESSADO_COM_SUCESSO.getId());
-
-        LOGGER.info("Total de retificações encontradas: {}", retificacoes.size());
-
-        // Criar mapa: retificarRecibo -> ID da ocorrência que retifica
-        Map<String, Long> mapaRetificacoes = criarMapaRetificacoes(retificacoes);
-
-        LOGGER.info("Mapa de retificações criado com {} entradas", mapaRetificacoes.size());
-
-        // Passo 3: Processar todas as ocorrências processadas com sucesso em batch
-        final int batchSize = 100;
-        int page = 0;
-        Page<Ocorrencia> pagina;
-        int totalAtualizacoes = 0;
-
-        LOGGER.info("Processando exclusões e retificações em batch...");
+        long ultimoId = ID_INICIAL;
+        int vinculos = 0;
+        int percorridas = 0;
+        List<Long> idsExclusoes;
 
         do {
-            PageRequest pageRequest = PageRequest.of(page, batchSize, Sort.by("id"));
-            pagina = ocorrenciaRepository.findAll(
-                    specs.nosEstados(Collections.singletonList(Estado.PROCESSADO_COM_SUCESSO)),
-                    pageRequest
-            );
+            idsExclusoes = ocorrenciaRepository.buscarIdsExclusoesAposId(
+                    Estado.PROCESSADO_COM_SUCESSO, TipoEvento.EXCLUSAO, ultimoId, lote());
 
-            int elemento = page * batchSize + pagina.getNumberOfElements();
-            LOGGER.info("Processando batch: {} de {} ocorrências", elemento, pagina.getTotalElements());
-
-            List<Ocorrencia> ocorrenciasParaAtualizar = new ArrayList<>();
-
-            for (Ocorrencia ocorrencia : pagina.getContent()) {
-                boolean atualizada = false;
-
-                // Verificar se esta ocorrência foi excluída
-                String nrRecibo = ocorrencia.getEvento() != null ? ocorrencia.getEvento().getNrRecibo() : null;
-                if (nrRecibo != null && mapaExclusoes.containsKey(nrRecibo)) {
-                    Long idExclusao = mapaExclusoes.get(nrRecibo);
-                    ocorrencia.setOcorrenciaExclusaoId(idExclusao);
-                    atualizada = true;
-                }
-
-                // Verificar se esta ocorrência foi retificada
-                if (nrRecibo != null && mapaRetificacoes.containsKey(nrRecibo)) {
-                    Long idRetificacao = mapaRetificacoes.get(nrRecibo);
-                    ocorrencia.setOcorrenciaRetificacaoId(idRetificacao);
-                    atualizada = true;
-                }
-
-                if (atualizada) {
-                    ocorrenciasParaAtualizar.add(ocorrencia);
-                }
+            if (!idsExclusoes.isEmpty()) {
+                vinculos += upgradeLoteServico.processarLoteExclusoes(idsExclusoes);
+                percorridas += idsExclusoes.size();
+                ultimoId = idsExclusoes.get(idsExclusoes.size() - 1);
+                LOGGER.info("Exclusões: {} percorridas, {} vínculos criados", percorridas, vinculos);
             }
+        } while (idsExclusoes.size() == TAMANHO_LOTE);
 
-            if (!ocorrenciasParaAtualizar.isEmpty()) {
-                ocorrenciaRepository.saveAll(ocorrenciasParaAtualizar);
-                totalAtualizacoes += ocorrenciasParaAtualizar.size();
-                LOGGER.info("Atualizadas {} ocorrências neste batch", ocorrenciasParaAtualizar.size());
+        return vinculos;
+    }
+
+    private int processarRetificacoes() {
+        LOGGER.info("Processando retificações...");
+
+        long ultimoId = ID_INICIAL;
+        int vinculos = 0;
+        int percorridas = 0;
+        List<Object[]> retificacoes;
+
+        do {
+            retificacoes = ocorrenciaRepository.buscarRetificacoesAposId(
+                    Estado.PROCESSADO_COM_SUCESSO, ultimoId, lote());
+
+            if (!retificacoes.isEmpty()) {
+                vinculos += upgradeLoteServico.processarLoteRetificacoes(retificacoes);
+                percorridas += retificacoes.size();
+                ultimoId = (Long) retificacoes.get(retificacoes.size() - 1)[0];
+                LOGGER.info("Retificações: {} percorridas, {} vínculos criados", percorridas, vinculos);
             }
+        } while (retificacoes.size() == TAMANHO_LOTE);
 
-            page++;
-        } while (pagina.hasNext());
-
-        LOGGER.info("Processamento de exclusões e retificações concluído. Total de {} ocorrências atualizadas", totalAtualizacoes);
+        return vinculos;
     }
 
     public void upgradePeriodoApuracao() {
@@ -174,7 +171,10 @@ public class UpgradeServico {
         }
     }
 
-    @Async
+    /**
+     * Fora do escopo desta correção: já processa em lotes a partir de uma lista de
+     * identificadores. Mantido como estava, de propósito.
+     */
     public void realizaUpgradePeriodoApuracao() {
         LOGGER.info("Upgrade: " + Upgrade.CAMPO_PERIODO_APURACAO.desUpgrade);
 
@@ -199,11 +199,10 @@ public class UpgradeServico {
         }
 
         // PASSO 2: Processar em batch usando os IDs
-        final int batchSize = 100;
         int totalAtualizacoes = 0;
 
-        for (int i = 0; i < idsParaAtualizar.size(); i += batchSize) {
-            int fim = Math.min(i + batchSize, idsParaAtualizar.size());
+        for (int i = 0; i < idsParaAtualizar.size(); i += TAMANHO_LOTE) {
+            int fim = Math.min(i + TAMANHO_LOTE, idsParaAtualizar.size());
             List<Long> batchIds = idsParaAtualizar.subList(i, fim);
 
             LOGGER.info("Processando batch {}-{} de {}", i + 1, fim, idsParaAtualizar.size());
@@ -255,31 +254,8 @@ public class UpgradeServico {
         return null;
     }
 
-    private static Map<String, Long> criarMapaExclusoes(List<Ocorrencia> exclusoes) {
-        Map<String, Long> mapaExclusoes = new HashMap<>();
-        for (Ocorrencia exclusao : exclusoes) {
-            if (exclusao.getDadosOcorrencia() instanceof Exclusao) {
-                Exclusao dadosExclusao = (Exclusao) exclusao.getDadosOcorrencia();
-                if (dadosExclusao.getInfoExclusao() != null
-                        && dadosExclusao.getInfoExclusao().getNrRecEvt() != null) {
-                    String nrRecEvt = dadosExclusao.getInfoExclusao().getNrRecEvt();
-                    mapaExclusoes.put(nrRecEvt, exclusao.getId());
-                }
-            }
-        }
-        return mapaExclusoes;
-    }
-
-    private static Map<String, Long> criarMapaRetificacoes(List<Object[]> retificacoes) {
-        Map<String, Long> mapaRetificacoes = new HashMap<>();
-        for (Object[] retificacao : retificacoes) {
-            Long id = (Long) retificacao[0];
-            String retificarRecibo = (String) retificacao[1];
-            if (retificarRecibo != null) {
-                mapaRetificacoes.put(retificarRecibo, id);
-            }
-        }
-        return mapaRetificacoes;
+    private Pageable lote() {
+        return PageRequest.of(0, TAMANHO_LOTE);
     }
 
     private void registrarUpgrade(Upgrade upgrade) {
