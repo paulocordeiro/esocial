@@ -3,6 +3,7 @@ package br.jus.tst.esocialjt.ocorrencia;
 import br.jus.tst.esocialjt.dominio.Estado;
 import br.jus.tst.esocialjt.dominio.Ocorrencia;
 import br.jus.tst.esocialjt.dominio.TipoEvento;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 import org.springframework.data.jpa.repository.Modifying;
@@ -53,11 +54,53 @@ public interface OcorrenciaRepository extends JpaRepository<Ocorrencia, Long>, J
             "WHERE o.evento.tipoEvento = ?1")
     List<OcorrenciaSumario> getSumario(TipoEvento tipoEvento);
 
-    @Query("SELECT o.id, o.retificarRecibo FROM Ocorrencia o WHERE o.retificarRecibo IS NOT NULL AND o.evento.estado.id = ?1")
-    List<Object[]> buscarOcorrenciasComRetificacao(Long estadoId);
-
     @Query("SELECT o FROM Ocorrencia o WHERE o.evento.nrRecibo = ?1")
     List<Ocorrencia> buscarPorRecibo(String recibo);
+
+    /**
+     * Paginação por keyset: percorre as exclusões em lotes sem OFFSET, cujo custo cresce a cada
+     * página. A ordenação crescente é obrigatória — é ela que faz a exclusão de maior id
+     * prevalecer no desempate.
+     */
+    @Query("SELECT o.id FROM Ocorrencia o WHERE o.evento.estado = :estado AND o.evento.tipoEvento = :tipo AND o.id > :ultimoId ORDER BY o.id")
+    List<Long> buscarIdsExclusoesAposId(
+            @Param("estado") Estado estado,
+            @Param("tipo") TipoEvento tipo,
+            @Param("ultimoId") Long ultimoId,
+            Pageable pageable
+    );
+
+    /** Projeção (id, retificarRecibo): ambos são colunas, então nenhuma entidade é materializada. */
+    @Query("SELECT o.id, o.retificarRecibo FROM Ocorrencia o WHERE o.retificarRecibo IS NOT NULL AND o.evento.estado = :estado AND o.id > :ultimoId ORDER BY o.id")
+    List<Object[]> buscarRetificacoesAposId(
+            @Param("estado") Estado estado,
+            @Param("ultimoId") Long ultimoId,
+            Pageable pageable
+    );
+
+    @Query("SELECT o.id FROM Ocorrencia o WHERE o.id > :ultimoId ORDER BY o.id")
+    List<Long> buscarIdsOcorrenciasAposId(@Param("ultimoId") Long ultimoId, Pageable pageable);
+
+    /**
+     * A subconsulta não é preferência de estilo: JPQL proíbe navegar por associação
+     * (o.evento.nrRecibo) no WHERE de um UPDATE em massa. O filtro por estado preserva a
+     * equivalência com o comportamento anterior, que só tocava alvos processados com sucesso.
+     */
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query("UPDATE Ocorrencia o SET o.ocorrenciaExclusaoId = :idExclusao WHERE o.id IN (SELECT t.id FROM Ocorrencia t WHERE t.evento.nrRecibo = :recibo AND t.evento.estado = :estado)")
+    int vincularExclusao(
+            @Param("idExclusao") Long idExclusao,
+            @Param("recibo") String recibo,
+            @Param("estado") Estado estado
+    );
+
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query("UPDATE Ocorrencia o SET o.ocorrenciaRetificacaoId = :idRetificacao WHERE o.id IN (SELECT t.id FROM Ocorrencia t WHERE t.evento.nrRecibo = :recibo AND t.evento.estado = :estado)")
+    int vincularRetificacao(
+            @Param("idRetificacao") Long idRetificacao,
+            @Param("recibo") String recibo,
+            @Param("estado") Estado estado
+    );
 
     @Query("SELECT o.id FROM Ocorrencia o WHERE " +
             "(:#{#estados.isEmpty()} = true OR o.evento.estado IN :estados) AND " +

@@ -77,7 +77,15 @@ public class OnStartup {
 
 	private void realizarUpgrades() {
 		LOGGER.info("Verificando upgrades...");
-		upgradeServico.realizarUpgrades();
-		LOGGER.info("Todos upgrades finalizados");
+		try {
+			upgradeServico.realizarUpgrades();
+			LOGGER.info("Todos upgrades finalizados");
+		} catch (Throwable falha) {
+			// Throwable, e não Exception: OutOfMemoryError é Error e escaparia da captura,
+			// impedindo o agendamento do ciclo de envio logo abaixo.
+			LOGGER.error("Falha ao realizar upgrades. A inicialização prossegue e os eventos "
+					+ "continuarão sendo enviados; os upgrades serão tentados novamente no "
+					+ "próximo início.", falha);
+		}
 	}
 }
