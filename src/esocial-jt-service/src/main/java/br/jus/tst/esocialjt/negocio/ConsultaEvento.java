@@ -23,6 +23,9 @@ public class ConsultaEvento {
 	private static final String QUERY_BASE = " SELECT e FROM Evento e ";
 	private static final String QUERY_BASE_DTO = " SELECT e.id as codEvento, e.tipoEvento.id as codTipoEvento, e.tipoEvento.grupoTipoEvento.id as codGrupoEvento FROM Evento e ";
 	private static final String QUERY_COUNT = " SELECT COUNT(e) FROM Evento e ";
+	// Ordena a fila por id (FIFO) para tornar o processamento determinístico,
+	// em vez de depender da ordem física retornada pelo banco.
+	private static final String ORDENACAO_FILA = " ORDER BY e.id ";
 
 	private EntityManager em;
 	private Set<String> campos = new LinkedHashSet<>();
@@ -33,7 +36,7 @@ public class ConsultaEvento {
 	}
 
 	public List<Evento> buscar() {
-		TypedQuery<Evento> typedQuery = em.createQuery(criarQuery(QUERY_BASE), Evento.class);
+		TypedQuery<Evento> typedQuery = em.createQuery(criarQuery(QUERY_BASE) + ORDENACAO_FILA, Evento.class);
 		parametros.forEach(typedQuery::setParameter);
 		return typedQuery.getResultList();
 	}
@@ -41,7 +44,7 @@ public class ConsultaEvento {
 	public List<EventoDTO> buscarDTO() {
 		List<EventoDTO> listaEventoDTO = new ArrayList<>();
 
-		TypedQuery<Tuple> typedQuery = em.createQuery(criarQuery(QUERY_BASE_DTO), Tuple.class);
+		TypedQuery<Tuple> typedQuery = em.createQuery(criarQuery(QUERY_BASE_DTO) + ORDENACAO_FILA, Tuple.class);
 		parametros.forEach(typedQuery::setParameter);
 		List<Tuple> resultado = typedQuery.getResultList();
 		
