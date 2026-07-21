@@ -64,9 +64,12 @@ public class TarefaEnvioEventos implements Tarefa {
 			LOGGER.info(eventosEmFila.size() + " eventos na fila");
 		}
 		
+		// IMPORTANTE: filtrar por 'habilitado' ANTES de limitar. Se limitarmos primeiro,
+		// eventos bloqueados no topo da fila (ex.: periódicos aguardando não-periódicos)
+		// ocupam toda a janela e congelam a fila, mesmo havendo eventos habilitados atrás.
 		List<EventoDTO> eventosHabilitados = eventosEmFila.stream()
-			.limit(LIMITE_EVENTOS_LOTE * lotesPorCiclo)
 			.filter(evento -> regrasFactory.getRegra(evento).habilitado(evento))
+			.limit(LIMITE_EVENTOS_LOTE * lotesPorCiclo)
 			.collect(Collectors.toList());
 		
 		// Verifica se algum evento é do grupo TABELA
